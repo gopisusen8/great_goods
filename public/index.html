@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Great Goods — Real-Time Multi-Store Inventory & Sales Management</title>
+  <meta name="description" content="Real-time multi-store food inventory and sales tracking platform. Monitor 4 retail stores, redistribute stock between branches to eliminate wastage, and empower store managers with live POS.">
+  <meta name="theme-color" content="#090D16">
+
+  <!-- Modern Google Typography -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+  <!-- Core Stylesheet -->
+  <link rel="stylesheet" href="/css/style.css">
+
+  <!-- Local Chart.js with CDN Fallback -->
+  <script src="/vendor/chart.js/chart.umd.js"></script>
+  <script>
+    if (typeof Chart === 'undefined') {
+      document.write('<script src="https://cdn.jsdelivr.net/npm/chart.js"><\/script>');
+    }
+  </script>
+
+  <!-- Socket.io Client -->
+  <script src="/socket.io/socket.io.js"></script>
+</head>
+<body>
+
+  <!-- Application Shell Header -->
+  <header class="app-header" id="app-header">
+    <div class="brand-wrapper">
+      <div class="brand-logo-icon" aria-hidden="true">
+        <svg viewBox="0 0 24 24">
+          <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+        </svg>
+      </div>
+      <div>
+        <h1 class="brand-title">Great Goods</h1>
+        <div class="brand-subtitle">Real-Time Multi-Store Inventory & Sales Management</div>
+      </div>
+    </div>
+
+    <!-- Live WebSocket Indicator -->
+    <div class="header-center-pill" id="sync-status-indicator" title="Connected to Real-Time Synchronizer">
+      <span class="pulse-dot"></span>
+      LIVE SYNC
+    </div>
+
+    <!-- Header Actions & Logged-In User Profile -->
+    <div class="header-actions">
+      <div id="header-user-info"></div>
+
+      <button type="button" class="btn-secondary" id="header-reset-btn" style="display: none;" title="Reset prototype to initial state">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align: middle; margin-right: 4px;"><path d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"/></svg>
+        Reset Data
+      </button>
+
+      <button type="button" class="btn-secondary" id="header-logout-btn" title="Switch User or Logout">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="vertical-align: middle; margin-right: 4px;"><path d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"/></svg>
+        Switch User
+      </button>
+    </div>
+  </header>
+
+  <!-- Dynamic Application Main View (Admin or Store Manager Dashboard) -->
+  <main id="app-main"></main>
+
+  <!-- Toast Notification Container -->
+  <div id="toast-container" aria-live="polite"></div>
+
+  <!-- Authentication Modal Overlay (Shown when logged out) -->
+  <div class="login-overlay" id="login-modal" style="display: none;">
+    <div class="login-card">
+      <div class="login-header">
+        <div class="login-logo" aria-hidden="true">
+          <svg viewBox="0 0 24 24">
+            <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/>
+          </svg>
+        </div>
+        <h2>Great Goods Portal</h2>
+        <p>Select a prototype role or enter credentials to access your dashboard</p>
+      </div>
+
+      <!-- Quick 1-Click Demo Accounts Selector -->
+      <div class="demo-logins-box">
+        <h4>⚡ One-Click Demo Logins</h4>
+        <div class="demo-btn-grid">
+          <button type="button" class="demo-account-btn admin-btn" data-username="admin" data-password="admin123" id="demo-login-admin">
+            <span><strong>👑 Business Owner (Admin)</strong> • All 4 Stores</span>
+            <span style="font-size:0.75rem; color:var(--amber);">admin / admin123 ➔</span>
+          </button>
+          
+          <button type="button" class="demo-account-btn" data-username="manager1" data-password="pass123" id="demo-login-mgr1">
+            <span><strong>🏪 Store 1 Manager</strong> • Downtown Central</span>
+            <span style="font-size:0.75rem; color:var(--text-muted);">manager1 ➔</span>
+          </button>
+
+          <button type="button" class="demo-account-btn" data-username="manager2" data-password="pass123" id="demo-login-mgr2">
+            <span><strong>🏪 Store 2 Manager</strong> • Westside Market</span>
+            <span style="font-size:0.75rem; color:var(--text-muted);">manager2 ➔</span>
+          </button>
+
+          <button type="button" class="demo-account-btn" data-username="manager3" data-password="pass123" id="demo-login-mgr3">
+            <span><strong>🏪 Store 3 Manager</strong> • East Bay Express</span>
+            <span style="font-size:0.75rem; color:var(--text-muted);">manager3 ➔</span>
+          </button>
+
+          <button type="button" class="demo-account-btn" data-username="manager4" data-password="pass123" id="demo-login-mgr4">
+            <span><strong>🏪 Store 4 Manager</strong> • Northwood Hub</span>
+            <span style="font-size:0.75rem; color:var(--text-muted);">manager4 ➔</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="divider">or login with credentials</div>
+
+      <!-- Manual Credential Form -->
+      <form id="login-form">
+        <div class="form-group">
+          <label class="form-label" for="login-username">Username</label>
+          <input type="text" id="login-username" class="form-input" placeholder="e.g. admin or manager1" required autocomplete="username">
+        </div>
+
+        <div class="form-group">
+          <label class="form-label" for="login-password">Password</label>
+          <input type="password" id="login-password" class="form-input" placeholder="Enter password" required autocomplete="current-password">
+        </div>
+
+        <div id="login-error" style="color: var(--rose); font-size: 0.8125rem; margin-bottom: 0.75rem; display: none;"></div>
+
+        <button type="submit" class="btn-primary" id="btn-login-submit">
+          Sign In to Great Goods
+        </button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Client-side Scripts -->
+  <script src="/js/api.js"></script>
+  <script src="/js/charts.js"></script>
+  <script src="/js/admin.js"></script>
+  <script src="/js/manager.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>
