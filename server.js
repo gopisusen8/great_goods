@@ -15,8 +15,15 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 3000;
-const DATA_FILE = path.join(__dirname, 'data', 'store_data.json');
-const SEED_FILE = path.join(__dirname, 'data', 'seed.json');
+const IS_VERCEL = process.env.VERCEL === '1' || !!process.env.VERCEL;
+
+// In Vercel serverless, /tmp is the only writable directory
+const DATA_FILE = IS_VERCEL
+  ? path.join('/tmp', 'store_data.json')
+  : path.join(__dirname, 'data', 'store_data.json');
+
+// Statically require seed data so bundlers (like Vercel @vercel/node) include it automatically
+const seedData = require('./data/seed.json');
 
 // Middleware
 app.use(cors());
@@ -25,29 +32,33 @@ app.use(express.static(path.join(__dirname, 'public')));
 // Serve Chart.js locally
 app.use('/vendor/chart.js', express.static(path.join(__dirname, 'node_modules', 'chart.js', 'dist')));
 
-// Ensure data persistence file exists
+// Safe persistent/in-memory data loader
 function loadData() {
-  if (!fs.existsSync(DATA_FILE)) {
-    const seed = fs.readFileSync(SEED_FILE, 'utf8');
-    fs.writeFileSync(DATA_FILE, seed, 'utf8');
-    return JSON.parse(seed);
-  }
   try {
-    const content = fs.readFileSync(DATA_FILE, 'utf8');
-    return JSON.parse(content);
+    if (fs.existsSync(DATA_FILE)) {
+      const content = fs.readFileSync(DATA_FILE, 'utf8');
+      return JSON.parse(content);
+    }
   } catch (err) {
-    console.error('Error reading data file, falling back to seed:', err);
-    const seed = fs.readFileSync(SEED_FILE, 'utf8');
-    fs.writeFileSync(DATA_FILE, seed, 'utf8');
-    return JSON.parse(seed);
+    console.warn('Could not read existing data file, using seed:', err.message);
   }
+
+  // Deep clone seedData to avoid mutating original require cache
+  const initialData = JSON.parse(JSON.stringify(seedData));
+  try {
+    fs.writeFileSync(DATA_FILE, JSON.stringify(initialData, null, 2), 'utf8');
+  } catch (err) {
+    console.warn('Could not write initial DATA_FILE (safe on serverless):', err.message);
+  }
+  return initialData;
 }
 
 function saveData(data) {
   try {
     fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2), 'utf8');
   } catch (err) {
-    console.error('Failed to save data:', err);
+    // Normal in serverless read-only environment
+    console.warn('Could not write to disk, data remains in memory:', err.message);
   }
 }
 
@@ -76,10 +87,11 @@ function authenticate(req, res, next) {
   }
 }
 
-// ---------------- REST API ROUTES ----------------
+// ---------------- API ROUTER ----------------
+const apiRouter = express.Router();
 
 // Auth: Login
-app.post('/api/auth/login', (req, res) => {
+apiRouter.post('/auth/login', (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ error: 'Username and password required' });
@@ -108,9 +120,8 @@ app.post('/api/auth/login', (req, res) => {
   });
 });
 
-// Get all stores, products, transfers, transactions (admin or general load)
-app.get('/api/state', authenticate, (req, res) => {
-  // Return complete state for admin, or store-scoped state for manager
+// Get state (admin or store-scoped manager)
+apiRouter.get('/state', authenticate, (req, res) => {
   if (req.user.role === 'admin') {
     return res.json({
       stores: appData.stores,
@@ -121,13 +132,11 @@ app.get('/api/state', authenticate, (req, res) => {
     });
   }
 
-  // Store Manager scoped view
   const store = appData.stores.find(s => s.id === req.user.storeId);
   if (!store) {
     return res.status(404).json({ error: 'Assigned store not found' });
   }
 
-  // Manager sees their store, products, incoming transfers for their store, and their store's transactions
   const incomingTransfers = appData.transfers.filter(t => t.toStoreId === req.user.storeId);
   const storeTransactions = appData.transactions.filter(
     tx => tx.storeId === req.user.storeId || tx.toStoreId === req.user.storeId || tx.fromStoreId === req.user.storeId
@@ -142,8 +151,8 @@ app.get('/api/state', authenticate, (req, res) => {
   });
 });
 
-// Public demo helper: quick account list for login UI
-app.get('/api/auth/demo-users', (req, res) => {
+// Demo helper: quick account list for login UI
+apiRouter.get('/auth/demo-users', (req, res) => {
   res.json(appData.users.map(u => ({
     username: u.username,
     role: u.role,
@@ -154,11 +163,10 @@ app.get('/api/auth/demo-users', (req, res) => {
 });
 
 // Store Action: Simulate Product Sale (Manager or Admin)
-app.post('/api/stores/:storeId/sell', authenticate, (req, res) => {
+apiRouter.post('/stores/:storeId/sell', authenticate, (req, res) => {
   const { storeId } = req.params;
   const { productId } = req.body;
 
-  // Authorization check
   if (req.user.role !== 'admin' && req.user.storeId !== storeId) {
     return res.status(403).json({ error: 'Access denied: You can only record sales for your assigned store.' });
   }
@@ -169,17 +177,14 @@ app.post('/api/stores/:storeId/sell', authenticate, (req, res) => {
   const product = appData.products.find(p => p.id === productId);
   if (!product) return res.status(404).json({ error: 'Product not found' });
 
-  // Inventory validation: prevent sales when available inventory is zero
   const currentStock = store.inventory[productId] || 0;
   if (currentStock <= 0) {
     return res.status(400).json({ error: `Cannot complete sale: ${product.name} is currently out of stock at ${store.name}.` });
   }
 
-  // Deduct inventory by 1, increase sales count by 1
   store.inventory[productId] = currentStock - 1;
   store.sales[productId] = (store.sales[productId] || 0) + 1;
 
-  // Update sales history graph data point (latest bucket)
   if (store.salesHistory && store.salesHistory[productId]) {
     const lastIdx = store.salesHistory[productId].length - 1;
     store.salesHistory[productId][lastIdx] += 1;
@@ -202,7 +207,6 @@ app.post('/api/stores/:storeId/sell', authenticate, (req, res) => {
   if (appData.transactions.length > 100) appData.transactions.pop();
   saveData(appData);
 
-  // Broadcast real-time update
   const payload = {
     type: 'SALE',
     storeId,
@@ -214,23 +218,23 @@ app.post('/api/stores/:storeId/sell', authenticate, (req, res) => {
     stores: appData.stores
   };
 
-  io.emit('data_updated', payload);
+  try { io.emit('data_updated', payload); } catch (e) {}
 
   res.json({
     success: true,
     message: `Sold 1 unit of ${product.name} at ${store.name}`,
     store,
-    transaction: tx
+    transaction: tx,
+    stores: appData.stores
   });
 });
 
 // Store Action: Product Addition (Manager or Admin)
-app.post('/api/stores/:storeId/stock', authenticate, (req, res) => {
+apiRouter.post('/stores/:storeId/stock', authenticate, (req, res) => {
   const { storeId } = req.params;
   const { productId, quantity } = req.body;
   const qty = parseInt(quantity, 10);
 
-  // Authorization check
   if (req.user.role !== 'admin' && req.user.storeId !== storeId) {
     return res.status(403).json({ error: 'Access denied: You can only adjust inventory for your assigned store.' });
   }
@@ -263,27 +267,28 @@ app.post('/api/stores/:storeId/stock', authenticate, (req, res) => {
   if (appData.transactions.length > 100) appData.transactions.pop();
   saveData(appData);
 
-  // Broadcast real-time update
-  io.emit('data_updated', {
+  const payload = {
     type: 'STOCK_ADDED',
     storeId,
     productId,
     newInventory: store.inventory[productId],
     transaction: tx,
     stores: appData.stores
-  });
+  };
+
+  try { io.emit('data_updated', payload); } catch (e) {}
 
   res.json({
     success: true,
     message: `Added ${qty} units of ${product.name} to ${store.name}`,
     store,
-    transaction: tx
+    transaction: tx,
+    stores: appData.stores
   });
 });
 
 // Admin Action: Inter-Store Product Transfer
-app.post('/api/transfers', authenticate, (req, res) => {
-  // Strictly Admin
+apiRouter.post('/transfers', authenticate, (req, res) => {
   if (req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Unauthorized: Only the Business Owner (Admin) can initiate inter-store transfers.' });
   }
@@ -291,12 +296,10 @@ app.post('/api/transfers', authenticate, (req, res) => {
   const { fromStoreId, toStoreId, productId, quantity } = req.body;
   const qty = parseInt(quantity, 10);
 
-  // Rule 1: The source and destination stores must be different
   if (!fromStoreId || !toStoreId || fromStoreId === toStoreId) {
     return res.status(400).json({ error: 'Source and destination stores must be different.' });
   }
 
-  // Rule 2: The selected quantity must be greater than zero
   if (isNaN(qty) || qty <= 0) {
     return res.status(400).json({ error: 'Transfer quantity must be greater than zero.' });
   }
@@ -312,7 +315,6 @@ app.post('/api/transfers', authenticate, (req, res) => {
     return res.status(404).json({ error: 'Selected product not found.' });
   }
 
-  // Rule 3: The source store must have sufficient available inventory
   const availableStock = fromStore.inventory[productId] || 0;
   if (availableStock < qty) {
     return res.status(400).json({
@@ -320,7 +322,6 @@ app.post('/api/transfers', authenticate, (req, res) => {
     });
   }
 
-  // Execute transfer: deduct from source, add to destination
   fromStore.inventory[productId] -= qty;
   toStore.inventory[productId] = (toStore.inventory[productId] || 0) + qty;
 
@@ -357,25 +358,27 @@ app.post('/api/transfers', authenticate, (req, res) => {
   if (appData.transactions.length > 100) appData.transactions.pop();
   saveData(appData);
 
-  // Broadcast real-time update to all clients (Admin and Managers)
-  io.emit('transfer_created', {
+  const payload = {
     type: 'TRANSFER_CREATED',
     transfer,
     transaction: tx,
     stores: appData.stores,
     transfers: appData.transfers
-  });
+  };
+
+  try { io.emit('transfer_created', payload); } catch (e) {}
 
   res.json({
     success: true,
     message: `Successfully transferred ${qty} ${product.name} from ${fromStore.name} to ${toStore.name}.`,
     transfer,
-    stores: appData.stores
+    stores: appData.stores,
+    transfers: appData.transfers
   });
 });
 
 // Store Manager Action: Acknowledge Incoming Product Transfer
-app.post('/api/transfers/:transferId/acknowledge', authenticate, (req, res) => {
+apiRouter.post('/transfers/:transferId/acknowledge', authenticate, (req, res) => {
   const { transferId } = req.params;
   const transfer = appData.transfers.find(t => t.id === transferId);
 
@@ -383,7 +386,6 @@ app.post('/api/transfers/:transferId/acknowledge', authenticate, (req, res) => {
     return res.status(404).json({ error: 'Transfer record not found.' });
   }
 
-  // Manager can only acknowledge transfers intended for their store, admin can acknowledge any
   if (req.user.role !== 'admin' && req.user.storeId !== transfer.toStoreId) {
     return res.status(403).json({ error: 'Access denied: You can only acknowledge transfers for your assigned store.' });
   }
@@ -411,39 +413,48 @@ app.post('/api/transfers/:transferId/acknowledge', authenticate, (req, res) => {
   appData.transactions.unshift(tx);
   saveData(appData);
 
-  // Broadcast real-time acknowledgment
-  io.emit('transfer_acknowledged', {
+  const payload = {
     type: 'TRANSFER_ACKNOWLEDGED',
     transfer,
     transaction: tx,
     transfers: appData.transfers
-  });
+  };
+
+  try { io.emit('transfer_acknowledged', payload); } catch (e) {}
 
   res.json({
     success: true,
     message: `Transfer #${transfer.id} acknowledged successfully.`,
-    transfer
+    transfer,
+    transfers: appData.transfers
   });
 });
 
 // Demo Helper: Reset data to initial seed
-app.post('/api/reset', authenticate, (req, res) => {
+apiRouter.post('/reset', authenticate, (req, res) => {
   if (req.user.role !== 'admin') {
     return res.status(403).json({ error: 'Only admin can reset system data' });
   }
-  const seed = fs.readFileSync(SEED_FILE, 'utf8');
-  fs.writeFileSync(DATA_FILE, seed, 'utf8');
-  appData = JSON.parse(seed);
 
-  io.emit('data_reset', {
-    message: 'System data reset to initial prototype state.',
-    stores: appData.stores,
-    transfers: appData.transfers,
-    transactions: appData.transactions
-  });
+  const initialData = JSON.parse(JSON.stringify(seedData));
+  appData = initialData;
+  saveData(appData);
+
+  try {
+    io.emit('data_reset', {
+      message: 'System data reset to initial prototype state.',
+      stores: appData.stores,
+      transfers: appData.transfers,
+      transactions: appData.transactions
+    });
+  } catch (e) {}
 
   res.json({ success: true, message: 'Data reset to initial prototype state successfully.' });
 });
+
+// Mount routes on BOTH '/api' and '/' to handle any Vercel URL rewrite variant
+app.use('/api', apiRouter);
+app.use('/', apiRouter);
 
 // Fallback to index.html for client-side navigation
 app.use((req, res) => {
@@ -459,9 +470,16 @@ io.on('connection', (socket) => {
   });
 });
 
-server.listen(PORT, () => {
-  console.log(`=================================================`);
-  console.log(` Great Goods Server Running on http://localhost:${PORT}`);
-  console.log(` Role-based Real-Time Multi-Store Management System`);
-  console.log(`=================================================`);
-});
+// Only listen on port if executed directly (e.g. node server.js locally)
+if (!IS_VERCEL && require.main === module) {
+  server.listen(PORT, () => {
+    console.log(`=================================================`);
+    console.log(` Great Goods Server Running on http://localhost:${PORT}`);
+    console.log(` Role-based Real-Time Multi-Store Management System`);
+    console.log(`=================================================`);
+  });
+}
+
+// Export for Vercel Serverless Function
+module.exports = app;
+module.exports.server = server;
